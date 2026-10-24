@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jeffry-cache-tax",
+  "description": "Jeffry's build of cache-tax, from the mods branch of jeffrydegrande/cache-tax.",
+  "owner": {
+    "name": "Jeffry Degrande",
+    "url": "https://github.com/jeffrydegrande"
+  },
+  "plugins": [
+    {
+      "name": "cache-tax",
+      "source": "./",
+      "description": "cache-tax, the Mod, with the refused prompt given back after /clear and the cold price shown before the send."
+    }
+  ]
+}
