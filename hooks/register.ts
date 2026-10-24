@@ -81,6 +81,7 @@ export type State = {
   stepWrites: StepWrites | null
   steps: number
   endingSid: string
+  refused: string
 }
 
 /** What this turn's main requests wrote before any compaction it saw, priced per request where the steps reported usage. */
@@ -176,6 +177,7 @@ export function resetForClear(s: State) {
   s.waitForTurn = false
   s.stepWrites = null
   s.steps = 0
+  s.refused = ''
   outdate(s)
   disarm(s)
 }
@@ -229,9 +231,15 @@ function statusText(s: State, now: number): string | undefined {
   return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
 }
 
+/** Without keepwarm, the row says what the next message costs once the cache is cold, before the guard has to. */
+function coldText(s: State, now: number): string | undefined {
+  if (s.deadline || s.stopped || !isCold(s, now) || s.ctx < BIG_TOKENS) return undefined
+  return `the next message re-writes up to ${fmtTok(s.ctx)} tokens, ${fmtUsd(coldUsd(s))}`
+}
+
 function updateStatus($: EngineInterface, s: State, now: number) {
   if (s.hasBand) $.ui.invalidate('ui.render')
-  else $.ui.status(statusText(s, now))
+  else $.ui.status(statusText(s, now) ?? coldText(s, now))
 }
 
 /** Cancels the timer. Every new timer is set right after this, so the tick also says the schedule changed. */
@@ -292,6 +300,7 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   // end cut short by its budget leaves no timer and no old id behind, only the keys below.
   const keys = [deadlineKey(s), everyKey(s)]
   const ending = s.sid
+  const refused = s.refused
   resetForClear(s)
   s.sid = ''
   s.endingSid = ending
@@ -305,6 +314,14 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   }
   for (const key of keys) await $.store.delete(key)
   if (reason === 'clear') updateStatus($, s, await $.clock.now())
+  // The refusal offered /clear in place of paying: the message the person wrote comes back as the new conversation's draft.
+  if (reason === 'clear' && refused) await giveBack($, refused)
+}
+
+/** Puts a refused prompt back in the prompt box, after anything typed there since. */
+async function giveBack($: EngineInterface, text: string) {
+  const box = await $.prompt.read()
+  await $.prompt.fill(box.text.trim() ? { text: `\n\n${text}`, mode: 'append' } : { text })
 }
 
 /** Reads the session the process runs now: its id, its model and the engine's figures for its context. Returns the time read with them. */
@@ -337,12 +354,12 @@ async function reseat($: EngineInterface, s: State) {
 async function arm($: EngineInterface, s: State) {
   disarm(s)
   s.retries = 0
-  if (!s.deadline) return
   const now = await $.clock.now()
   // A timer set while the clock was read, such as a retry, is replaced here, never left running beside this one;
   // from this line to the assignment below nothing awaits.
   disarm(s)
   s.retries = 0
+  if (!s.deadline) return watchCold($, s, now)
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
   if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
@@ -355,6 +372,14 @@ async function arm($: EngineInterface, s: State) {
     }
   } else {
     s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
+  }
+  updateStatus($, s, now)
+}
+
+/** No window, so nothing pings: one wake at the cold mark turns the row cold, sending nothing. */
+function watchCold($: EngineInterface, s: State, now: number) {
+  if (s.lastRequestAt && !s.compacted && s.ctx >= BIG_TOKENS && !isCold(s, now)) {
+    s.pending = $.clock.after(s.lastRequestAt + TTL_MS - now, () => { void arm($, s) })
   }
   updateStatus($, s, now)
 }
@@ -491,6 +516,7 @@ export function freshState(): State {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     resumedAt: 0, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
     waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, steps: 0, endingSid: '',
+    refused: '',
   }
 }
 
@@ -512,7 +538,7 @@ export const register: Register = on => {
     const rest = await next(e)
     if (!s.hasBand || e.props.hasSurvey) return rest
     const now = await $.clock.now()
-    const text = statusText(s, now)
+    const text = statusText(s, now) ?? coldText(s, now)
     if (!text || (s.deadline && now >= s.deadline)) return rest
     const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
     const color = noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (light ? '#c15f3c' : '#d97757') : undefined
@@ -669,6 +695,8 @@ export const register: Register = on => {
       if (cold && s.ctx >= BIG_TOKENS) $.ui.log(unknownText(s))
       return next(e)
     }
+    // Only the last refused message is held, and only until the person sends anything.
+    s.refused = ''
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
     // A refused prompt that no person sent would be lost: nobody is there to send it again.
     const unattended = UNATTENDED.has(e.origin.kind)
@@ -683,7 +711,8 @@ export const register: Register = on => {
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
+    s.refused = e.text
+    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear, and this message comes back in the prompt box for the new conversation.` }
   })
 
   on('turn.step', async function* ($, e, next) {

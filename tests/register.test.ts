@@ -55,6 +55,13 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const status: Array<string | undefined> = []
   const logs: string[] = []
   const entered: string[] = []
+  // The prompt box: the engine's own draft, and what a fill writes into it.
+  const box = { text: '' }
+  on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
+  on('prompt.fill', ($, e) => {
+    box.text = e.mode === 'append' ? box.text + e.text : e.text
+    return { isFilled: true, text: box.text, cursor: box.text.length }
+  })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: typeof opts.sid === 'function' ? opts.sid() : opts.sid ?? 'S1' }))
@@ -84,7 +91,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     const value: ModelForkResult = { isAnswered: true, text: 'warm', usage: { input_tokens: a.input ?? 2, output_tokens: a.out ?? 1, cache_read_input_tokens: a.read, cache_creation_input_tokens: a.write } }
     return { value }
   })
-  return { forks, status, logs, entered, reads }
+  return { forks, status, logs, entered, reads, box }
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
@@ -161,7 +168,9 @@ describe('cache indicator', () => {
       expect((await ui.find({ type: 'Text', text: /^cold$/ }))?.props.color).toBe('#c15f3c')
       expect(w.forks.length).toBe(1)
       await $.command.run(run('keepwarm', 'off'))
-      expect(await ui.find({ type })).toBe(undefined)
+      // Off ends the window, not the warning: the cache is still cold and the next message still pays.
+      expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold · the next message re-writes up to 201k tokens, \$4\.01/)
+      expect((await ui.find({ type }))?.props.source).toEqual(surface === 'terminal' ? { png: statusIcons.light.cold.png } : statusIcons.light.cold.svg)
     })
 
     test(`${surface}: NO_COLOR uses a bold text icon and uncolored state`, async ($, on) => {
@@ -269,6 +278,57 @@ describe('cache indicator', () => {
     })
   }
 
+  test('without keepwarm the row stays hidden while warm and shows the price once the cache is cold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    await $.turn.complete(turn())
+    expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
+    await clock.advance(HOUR - MIN)
+    expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
+    await clock.advance(MIN)
+    expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('#d97757')
+    expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold · the next message re-writes up to 201k tokens, \$4\.01$/)
+    await clock.advance(2 * HOUR)
+    expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold · the next message re-writes up to 201k tokens, \$4\.01$/)
+    // The paid send makes the cache warm again: the row goes, and keepwarm takes it from there.
+    await $.prompt.submit(prompt('hi'))
+    await $.prompt.submit(prompt('hi'))
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200502 }) }))
+    expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/warm · keepwarm 3h00m left/)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('without keepwarm a small context or a cleared conversation shows no cold row', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 20000 }) }))
+    await clock.advance(2 * HOUR)
+    expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold · the next message re-writes up to 201k tokens/)
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('headless shows the cold price in the plain status without keepwarm', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    expect(w.status.at(-1)).toBe(undefined)
+    await clock.advance(HOUR)
+    expect(w.status.at(-1)).toBe('the next message re-writes up to 201k tokens, $4.01')
+    await $.command.run(run('keepwarm', '90m'))
+    expect(w.status.at(-1)).toBe('keepwarm 1h30m left · cold now, first ping 50m after the next turn')
+    expect(w.forks.length).toBe(0)
+  })
+
   test('a warm ping keeps the green row and a cold read stops it neutrally', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [warm, { read: 0, write: 200000 }])
@@ -332,6 +392,77 @@ describe('guard', () => {
     const second = await $.prompt.submit(prompt('hi'))
     expect(second.drop).toBe(undefined)
     expect(w.entered).toEqual(['hi'])
+  })
+
+  test('a refused message comes back in the prompt box after /clear', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    const first = await $.prompt.submit(prompt('a long prompt'))
+    expect(first.drop).toMatch(/Or \/clear, and this message comes back in the prompt box for the new conversation\.$/)
+    // The person empties the box to type /clear, and nothing comes back before it.
+    expect(w.box.text).toBe('')
+    expect((await $.prompt.submit(prompt('/cache-tax'))).drop).toBe(undefined)
+    await $.prompt.submit(prompt('/clear'))
+    expect(w.box.text).toBe('')
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    expect(w.entered).toEqual(['/cache-tax', '/clear'])
+    // The new conversation has no cold cache: the message goes through, and a second /clear gives nothing back.
+    await $.prompt.submit(prompt('a long prompt'))
+    expect(w.entered.at(-1)).toBe('a long prompt')
+    w.box.text = ''
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('')
+  })
+
+  test('a refused message given back after /clear keeps what was typed in the box', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    w.box.text = 'a note'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a note\n\na long prompt')
+  })
+
+  for (const [name, after] of [
+    ['the resend', 'a long prompt'],
+    ['another message', 'something else'],
+  ] as const) {
+    test(`a refused message is not given back after ${name} went through`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      await $.prompt.submit(prompt('a long prompt'))
+      await $.prompt.submit(prompt(after))
+      expect(w.entered).toEqual([after])
+      await $.classic.SessionStart({ source: 'clear' })
+      expect(w.box.text).toBe('')
+    })
+  }
+
+  test('a refused message is not given back on a resume or in warn mode', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    await $.classic.SessionStart({ session_id: 'S2', source: 'resume', seconds_since_last_response: 30 })
+    expect(w.box.text).toBe('')
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('warned'))
+    expect(w.entered).toEqual(['warned'])
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('')
   })
 
   test('lets slash commands, warm sends and small contexts through', async ($, on) => {
@@ -737,7 +868,7 @@ describe('keepwarm', () => {
     expect(w.forks.length).toBe(0)
     expect(store.has('deadline:S1')).toBe(false)
     expect(store.has('every:S1')).toBe(false)
-    expect(w.status.at(-1)).toBe(undefined)
+    expect(w.status.at(-1)).toBe('the next message re-writes up to 201k tokens, $4.01')
     expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
     await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
     await clock.advance(49 * MIN)
@@ -1894,6 +2025,23 @@ describe('a managed plugin above the user tier', () => {
     await $.command.run(run('keepwarm', '2h'))
     expect(store.get('deadline:S2')).toBe(START + 4 * HOUR + 50 * MIN)
     expect(store.has('deadline:S1')).toBe(false)
+  })
+
+  test('a refused message comes back after a /clear that reaches the mod only through session.end', { plugins: [managed] }, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let sid = 'S1'
+    const w = world(on, [], { sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    expect((await $.prompt.submit(prompt('a long prompt'))).drop).toMatch(/comes back in the prompt box/)
+    await end($, 'S1')
+    expect(w.box.text).toBe('a long prompt')
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    expect((await $.prompt.submit(prompt('a long prompt'))).drop).toBe(undefined)
+    expect(w.entered).toEqual(['a long prompt'])
   })
 
   test('always after /clear arms the new conversation under its own id', { plugins: [managed] }, async ($, on) => {
