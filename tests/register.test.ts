@@ -56,11 +56,13 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   // The prompt box: the engine's own draft, and what a fill writes into it.
-  // `refuse` answers the next fill as a dialog would; `fail` makes it throw, as a hook cut short by its budget never answers.
-  const box = { text: '', fills: 0, refuse: false, fail: false }
+  // `refuse` answers the next fill as a dialog would; `fail` makes it throw, as a hook cut short by its budget never answers;
+  // `hold` keeps a fill out until it resolves.
+  const box = { text: '', fills: 0, refuse: false, fail: false, hold: null as Promise<void> | null }
   on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
-  on('prompt.fill', ($, e) => {
+  on('prompt.fill', async ($, e) => {
     box.fills++
+    if (box.hold) await box.hold
     if (box.fail) {
       box.fail = false
       throw new Error('budget')
@@ -479,6 +481,19 @@ describe('guard', () => {
     expect(w.box.fills).toBe(0)
   })
 
+  test('a /clear with a longer draft that holds the refused message still appends it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('fix it'))
+    w.box.text = 'fix it later, first explain the test'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('fix it later, first explain the test\n\nfix it')
+    expect(w.box.fills).toBe(1)
+  })
+
   test('a prompt nobody sent between the refusal and /clear leaves the refused message due', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])
@@ -517,7 +532,7 @@ describe('guard', () => {
     w.box.refuse = true
     await $.classic.SessionStart({ source: 'clear' })
     expect(w.box.fills).toBe(1)
-    expect(w.logs.at(-1)).toBe('could not put the refused message back in the prompt box. Write it again, or press the up arrow if the box kept it.')
+    expect(w.logs.at(-1)).toBe('could not put the refused message back in the prompt box. Write it again.')
     expect(w.logs.some(l => l.includes('secret'))).toBe(false)
   })
 
@@ -2134,6 +2149,49 @@ describe('a managed plugin above the user tier', () => {
     expect(w.box.text).toBe('a long prompt')
     expect((await $.prompt.submit(prompt('a long prompt'))).drop).toBe(undefined)
     expect(w.entered).toEqual(['a long prompt'])
+  })
+
+  test('a classic start while the session.end give-back is still out writes the message once', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let sid = 'S1'
+    const w = world(on, [], { sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    w.box.text = 'a note'
+    let release = () => {}
+    w.box.hold = new Promise<void>(r => { release = r })
+    const ending = end($, 'S1')
+    await settle()
+    expect(w.box.fills).toBe(1)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    release()
+    await ending
+    expect(w.box.text).toBe('a note\n\na long prompt')
+    expect(w.box.fills).toBe(1)
+  })
+
+  test('an end cut short in its store cleanup leaves the refused message for the classic start', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    let sid = 'S1'
+    const held = holdDeletes('deadline:S1')
+    const w = world(on, [], { store, sid: () => sid, storeGate: held.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    const ending = end($, 'S1')
+    await settle()
+    expect(held.held()).toBe(1)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    held.release()
+    await ending
+    expect(w.box.fills).toBe(1)
   })
 
   test('a give-back that session.end did not finish is done by the classic start', async ($, on) => {

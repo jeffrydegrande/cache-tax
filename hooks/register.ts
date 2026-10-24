@@ -307,6 +307,9 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   resetForClear(s)
   s.sid = ''
   s.endingSid = ending
+  // The refusal offered /clear in place of paying: the message the person wrote comes back as the new conversation's
+  // draft. It is due from here, before any await, so an end cut short anywhere leaves it for the classic start to write.
+  if (reason === 'clear') s.restore = refused
   // /clear ends the conversation the window was armed for. A resume carries the window on to the next one, under its
   // id: the old id's keys go here, or a /keepwarm off there could never find them and the old session would re-arm them.
   if (reason === 'clear') {
@@ -316,9 +319,6 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
     s.retries = 0
   }
   for (const key of keys) await $.store.delete(key)
-  // The refusal offered /clear in place of paying: the message the person wrote comes back as the new conversation's
-  // draft. It is written once the end step has run, and stays due until a fill answers, so a later start can retry it.
-  if (reason === 'clear') s.restore = refused
   if (reason === 'clear') updateStatus($, s, await $.clock.now())
 }
 
@@ -326,16 +326,19 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
 async function giveBack($: EngineInterface, s: State) {
   const text = s.restore
   if (!text) return
-  const box = await $.prompt.read()
-  if (box.text.includes(text.trim())) {
-    s.restore = ''
-    return
-  }
-  const filled = await $.prompt.fill(box.text.trim() ? { text: `\n\n${text}`, mode: 'append' } : { text })
-  // Only the call that wrote it, or found it gone, settles it: a second call may have answered meanwhile.
-  if (s.restore !== text) return
+  // Claimed before any await, so a second call while this one is out writes nothing.
   s.restore = ''
-  if (!filled.isFilled) $.ui.log('could not put the refused message back in the prompt box. Write it again, or press the up arrow if the box kept it.')
+  let filled: boolean
+  try {
+    const box = await $.prompt.read()
+    if (box.text.trim() === text.trim()) return
+    filled = (await $.prompt.fill(box.text.trim() ? { text: `\n\n${text}`, mode: 'append' } : { text })).isFilled
+  } catch (err) {
+    // A call that never answered, such as one cut short by session.end's budget, leaves the text due for the classic start.
+    s.restore = text
+    throw err
+  }
+  if (!filled) $.ui.log('could not put the refused message back in the prompt box. Write it again.')
 }
 
 /** Reads the session the process runs now: its id, its model and the engine's figures for its context. Returns the time read with them. */
