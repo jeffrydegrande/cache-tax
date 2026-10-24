@@ -56,9 +56,18 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   // The prompt box: the engine's own draft, and what a fill writes into it.
-  const box = { text: '' }
+  // `refuse` answers the next fill as a dialog would; `fail` makes it throw, as a hook cut short by its budget never answers;
+  // `hold` keeps a fill out until it resolves.
+  const box = { text: '', fills: 0, refuse: false, fail: false, hold: null as Promise<void> | null }
   on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
-  on('prompt.fill', ($, e) => {
+  on('prompt.fill', async ($, e) => {
+    box.fills++
+    if (box.hold) await box.hold
+    if (box.fail) {
+      box.fail = false
+      throw new Error('budget')
+    }
+    if (box.refuse) return { isFilled: false, refusal: 'dialog' as const, text: box.text, cursor: box.text.length }
     box.text = e.mode === 'append' ? box.text + e.text : e.text
     return { isFilled: true, text: box.text, cursor: box.text.length }
   })
@@ -316,6 +325,34 @@ describe('cache indicator', () => {
     expect(w.forks.length).toBe(0)
   })
 
+  test('/keepwarm off while warm still turns the row cold at the cold mark', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '2h'))
+    await clock.advance(10 * MIN)
+    await $.command.run(run('keepwarm', 'off'))
+    expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
+    await clock.advance(50 * MIN)
+    expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold · the next message re-writes up to 201k tokens, \$4\.01$/)
+    expect(w.forks.length).toBe(0)
+  })
+
+  test('a window that expires while warm still turns the plain status cold at the cold mark', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '20m'))
+    await clock.advance(20 * MIN)
+    expect(w.status.at(-1)).toBe(undefined)
+    await clock.advance(40 * MIN)
+    expect(w.status.at(-1)).toBe('the next message re-writes up to 201k tokens, $4.01')
+    expect(w.forks.length).toBe(0)
+  })
+
   test('headless shows the cold price in the plain status without keepwarm', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])
@@ -401,7 +438,7 @@ describe('guard', () => {
     await $.turn.complete(turn())
     await clock.advance(3 * HOUR)
     const first = await $.prompt.submit(prompt('a long prompt'))
-    expect(first.drop).toMatch(/Or \/clear, and this message comes back in the prompt box for the new conversation\.$/)
+    expect(first.drop).toMatch(/Or \/clear, and the text of this message comes back in the prompt box for the new conversation\.$/)
     // The person empties the box to type /clear, and nothing comes back before it.
     expect(w.box.text).toBe('')
     expect((await $.prompt.submit(prompt('/cache-tax'))).drop).toBe(undefined)
@@ -428,6 +465,75 @@ describe('guard', () => {
     w.box.text = 'a note'
     await $.classic.SessionStart({ source: 'clear' })
     expect(w.box.text).toBe('a note\n\na long prompt')
+  })
+
+  test('a /clear with the refused message still in the box does not write it twice', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    // The engine put the dropped text back, and a /clear from outside the box (a keybinding, the desktop app) left it there.
+    w.box.text = 'a long prompt'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    expect(w.box.fills).toBe(0)
+  })
+
+  test('a /clear with a longer draft that holds the refused message still appends it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('fix it'))
+    w.box.text = 'fix it later, first explain the test'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('fix it later, first explain the test\n\nfix it')
+    expect(w.box.fills).toBe(1)
+  })
+
+  test('a prompt nobody sent between the refusal and /clear leaves the refused message due', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    await $.prompt.submit({ text: 'task done', wait: false, origin: { kind: 'task-notification' } })
+    expect(w.entered).toEqual(['task done'])
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+  })
+
+  for (const kind of ['bridge', 'sdk'] as const) {
+    test(`a ${kind} prompt is refused with the note, and nothing comes back in the local box`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      const r = await $.prompt.submit({ text: 'from afar', wait: false, origin: { kind } as PromptSubmitInput['origin'] })
+      expect(r.drop).toMatch(/Or \/clear and start from a note\.$/)
+      await $.classic.SessionStart({ source: 'clear' })
+      expect(w.box.text).toBe('')
+      expect(w.box.fills).toBe(0)
+    })
+  }
+
+  test('a fill the box refuses is logged once, without the text', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('a secret plan'))
+    w.box.refuse = true
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.fills).toBe(1)
+    expect(w.logs.at(-1)).toBe('could not put the refused message back in the prompt box. Write it again.')
+    expect(w.logs.some(l => l.includes('secret'))).toBe(false)
   })
 
   for (const [name, after] of [
@@ -2037,11 +2143,72 @@ describe('a managed plugin above the user tier', () => {
     expect((await $.prompt.submit(prompt('a long prompt'))).drop).toMatch(/comes back in the prompt box/)
     await end($, 'S1')
     expect(w.box.text).toBe('a long prompt')
+    expect(w.box.fills).toBe(1)
     sid = 'S2'
     await $.classic.SessionStart({ source: 'clear' })
     expect(w.box.text).toBe('a long prompt')
     expect((await $.prompt.submit(prompt('a long prompt'))).drop).toBe(undefined)
     expect(w.entered).toEqual(['a long prompt'])
+  })
+
+  test('a classic start while the session.end give-back is still out writes the message once', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let sid = 'S1'
+    const w = world(on, [], { sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    w.box.text = 'a note'
+    let release = () => {}
+    w.box.hold = new Promise<void>(r => { release = r })
+    const ending = end($, 'S1')
+    await settle()
+    expect(w.box.fills).toBe(1)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    release()
+    await ending
+    expect(w.box.text).toBe('a note\n\na long prompt')
+    expect(w.box.fills).toBe(1)
+  })
+
+  test('an end cut short in its store cleanup leaves the refused message for the classic start', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    let sid = 'S1'
+    const held = holdDeletes('deadline:S1')
+    const w = world(on, [], { store, sid: () => sid, storeGate: held.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    const ending = end($, 'S1')
+    await settle()
+    expect(held.held()).toBe(1)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    held.release()
+    await ending
+    expect(w.box.fills).toBe(1)
+  })
+
+  test('a give-back that session.end did not finish is done by the classic start', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let sid = 'S1'
+    const w = world(on, [], { sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(2 * HOUR)
+    await $.prompt.submit(prompt('a long prompt'))
+    w.box.fail = true
+    await end($, 'S1')
+    expect(w.box.text).toBe('')
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(w.box.text).toBe('a long prompt')
+    expect(w.box.fills).toBe(2)
   })
 
   test('always after /clear arms the new conversation under its own id', { plugins: [managed] }, async ($, on) => {
