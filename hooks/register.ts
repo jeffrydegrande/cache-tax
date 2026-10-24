@@ -81,6 +81,8 @@ export type State = {
   stepWrites: StepWrites | null
   steps: number
   endingSid: string
+  refused: string
+  restore: string
 }
 
 /** What this turn's main requests wrote before any compaction it saw, priced per request where the steps reported usage. */
@@ -176,6 +178,8 @@ export function resetForClear(s: State) {
   s.waitForTurn = false
   s.stepWrites = null
   s.steps = 0
+  s.refused = ''
+  s.restore = ''
   outdate(s)
   disarm(s)
 }
@@ -229,9 +233,15 @@ function statusText(s: State, now: number): string | undefined {
   return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
 }
 
+/** Without keepwarm, the row says what the next message costs once the cache is cold, before the guard has to. */
+function coldText(s: State, now: number): string | undefined {
+  if (s.deadline || s.stopped || !isCold(s, now) || s.ctx < BIG_TOKENS) return undefined
+  return `the next message re-writes up to ${fmtTok(s.ctx)} tokens, ${fmtUsd(coldUsd(s))}`
+}
+
 function updateStatus($: EngineInterface, s: State, now: number) {
   if (s.hasBand) $.ui.invalidate('ui.render')
-  else $.ui.status(statusText(s, now))
+  else $.ui.status(statusText(s, now) ?? coldText(s, now))
 }
 
 /** Cancels the timer. Every new timer is set right after this, so the tick also says the schedule changed. */
@@ -283,7 +293,8 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
   if (forgetAlways) await $.store.delete(KEY_ALWAYS)
-  updateStatus($, s, await $.clock.now())
+  // The window is gone, not the cache: the row still has to turn cold at the cold mark.
+  watchCold($, s, await $.clock.now())
 }
 
 /** The conversation ended under /clear or an in-process resume. The next one's id cannot be read until the engine has switched, so the state is left unseated. */
@@ -292,9 +303,13 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   // end cut short by its budget leaves no timer and no old id behind, only the keys below.
   const keys = [deadlineKey(s), everyKey(s)]
   const ending = s.sid
+  const refused = s.refused
   resetForClear(s)
   s.sid = ''
   s.endingSid = ending
+  // The refusal offered /clear in place of paying: the message the person wrote comes back as the new conversation's
+  // draft. It is due from here, before any await, so an end cut short anywhere leaves it for the classic start to write.
+  if (reason === 'clear') s.restore = refused
   // /clear ends the conversation the window was armed for. A resume carries the window on to the next one, under its
   // id: the old id's keys go here, or a /keepwarm off there could never find them and the old session would re-arm them.
   if (reason === 'clear') {
@@ -305,6 +320,25 @@ async function endConversation($: EngineInterface, s: State, reason: 'clear' | '
   }
   for (const key of keys) await $.store.delete(key)
   if (reason === 'clear') updateStatus($, s, await $.clock.now())
+}
+
+/** Puts a refused prompt that is due back in the prompt box, after anything typed there since, unless the box holds it already. */
+async function giveBack($: EngineInterface, s: State) {
+  const text = s.restore
+  if (!text) return
+  // Claimed before any await, so a second call while this one is out writes nothing.
+  s.restore = ''
+  let filled: boolean
+  try {
+    const box = await $.prompt.read()
+    if (box.text.trim() === text.trim()) return
+    filled = (await $.prompt.fill(box.text.trim() ? { text: `\n\n${text}`, mode: 'append' } : { text })).isFilled
+  } catch (err) {
+    // A call that never answered, such as one cut short by session.end's budget, leaves the text due for the classic start.
+    s.restore = text
+    throw err
+  }
+  if (!filled) $.ui.log('could not put the refused message back in the prompt box. Write it again.')
 }
 
 /** Reads the session the process runs now: its id, its model and the engine's figures for its context. Returns the time read with them. */
@@ -337,12 +371,12 @@ async function reseat($: EngineInterface, s: State) {
 async function arm($: EngineInterface, s: State) {
   disarm(s)
   s.retries = 0
-  if (!s.deadline) return
   const now = await $.clock.now()
   // A timer set while the clock was read, such as a retry, is replaced here, never left running beside this one;
   // from this line to the assignment below nothing awaits.
   disarm(s)
   s.retries = 0
+  if (!s.deadline) return watchCold($, s, now)
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
   if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
@@ -355,6 +389,14 @@ async function arm($: EngineInterface, s: State) {
     }
   } else {
     s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
+  }
+  updateStatus($, s, now)
+}
+
+/** No window, so nothing pings: one wake at the cold mark turns the row cold, sending nothing. */
+function watchCold($: EngineInterface, s: State, now: number) {
+  if (s.lastRequestAt && !s.compacted && s.ctx >= BIG_TOKENS && !isCold(s, now)) {
+    s.pending = $.clock.after(s.lastRequestAt + TTL_MS - now, () => { void arm($, s) })
   }
   updateStatus($, s, now)
 }
@@ -491,6 +533,7 @@ export function freshState(): State {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     resumedAt: 0, transcript: 0, guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
     waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null, steps: 0, endingSid: '',
+    refused: '', restore: '',
   }
 }
 
@@ -512,7 +555,7 @@ export const register: Register = on => {
     const rest = await next(e)
     if (!s.hasBand || e.props.hasSurvey) return rest
     const now = await $.clock.now()
-    const text = statusText(s, now)
+    const text = statusText(s, now) ?? coldText(s, now)
     if (!text || (s.deadline && now >= s.deadline)) return rest
     const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
     const color = noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (light ? '#c15f3c' : '#d97757') : undefined
@@ -584,7 +627,9 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     // Only the conversation this state sits in: after the classic start of the next one, the old id is history.
     if ((e.reason === 'clear' || e.reason === 'resume') && e.sessionId === s.sid) await endConversation($, s, e.reason)
-    return next(e)
+    const r = await next(e)
+    await giveBack($, s)
+    return r
   })
 
   // Resume fields seed the guard before any turn of the resumed session has run.
@@ -597,7 +642,10 @@ export const register: Register = on => {
     if (s.sid && (e.session_id === undefined ? e.source === 'clear' : e.session_id !== s.sid)) await endConversation($, s, e.source === 'clear' ? 'clear' : 'resume')
     // No session.start fires after /clear, so this is where always arms the new conversation.
     await reseat($, s)
-    if (e.source === 'clear') return r
+    if (e.source === 'clear') {
+      await giveBack($, s)
+      return r
+    }
     const line = seedFromResume(s, e, await $.clock.now())
     if (line) $.ui.log(line)
     // The seeded clock decides whether a restored or always window pings before the first turn: never when it is cold.
@@ -669,9 +717,14 @@ export const register: Register = on => {
       if (cold && s.ctx >= BIG_TOKENS) $.ui.log(unknownText(s))
       return next(e)
     }
-    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
     // A refused prompt that no person sent would be lost: nobody is there to send it again.
     const unattended = UNATTENDED.has(e.origin.kind)
+    // Only the last refused message is held, and only until the person sends another; a prompt nobody sent leaves it.
+    if (!unattended) {
+      s.refused = ''
+      s.restore = ''
+    }
+    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
     if (s.guard === 'warn' || unattended) {
       $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(holdMs(s))} once it lands.`)
       s.coldWritePending = true
@@ -683,7 +736,11 @@ export const register: Register = on => {
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
+    // Only a prompt typed in this session's box can come back there; Remote Control, channels and SDK hosts have their own.
+    const local = e.origin.kind === 'composer'
+    if (local) s.refused = e.text
+    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. ` +
+      (local ? 'Or /clear, and the text of this message comes back in the prompt box for the new conversation.' : 'Or /clear and start from a note.') }
   })
 
   on('turn.step', async function* ($, e, next) {
